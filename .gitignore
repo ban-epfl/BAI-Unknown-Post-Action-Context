@@ -1,0 +1,22 @@
+# Ignore __pycache__ folders
+__pycache__/
+
+# Ignore Python compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# Optionally ignore other Python-related files
+*.egg-info/
+*.egg
+*.so
+
+# Any virtual environment folder
+.venv/
+venv/
+# local logs of the experiment runs
+logs/
+*.tmp
+# png previews of the figures (the pdf files are tracked)
+figures/*.png
+.DS_Store

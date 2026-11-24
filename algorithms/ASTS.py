@@ -1,0 +1,131 @@
+from utils import *
+import cvxpy as cp
+from algorithms.TS import TS
+import itertools
+
+# known A Separator Track and Stop
+class ASTS(TS):
+    def __init__(self, n, k, A, confidence, mode = {'fast': True}):
+        super().__init__(n, k, confidence, mode)
+        self.A = A
+        
+        self.N_A = np.zeros(n)
+        self.N_Z = np.zeros(k)
+        self.sum_of_rewards = np.zeros(k)
+
+    def get_mu_hat(self):
+        return self.sum_of_rewards / self.N_Z
+    
+    def get_means_hat(self):
+        return self.A @ self.get_mu_hat()
+
+    def best_empirical_arm(self):
+        mu_hat = self.get_mu_hat()
+
+        means_hat = np.dot(self.A, mu_hat)
+        delta_hat = np.max(means_hat) - means_hat
+
+        best_arm = np.argmax(means_hat)  
+        return best_arm, means_hat, delta_hat
+
+    def lambda_hat(self):
+        best_arm, _, delta_hat = self.best_empirical_arm()
+
+        denom = np.sum((self.A - self.A[best_arm])**2 / self.N_Z, axis=1) 
+        result = (delta_hat**2) / (2 * denom)
+
+        #since we have NaN in the i*-th element and that should not be computed in min
+        return np.nanmin(result)
+
+    def beta_t_mu(self, delta):
+        return (
+            self.k * C_exp(np.log(1/delta) / self.k) +
+            3 * sum([np.log(1 + np.log(self.N_Z[j])) for j in range(self.k)])
+        )
+
+    def stopping_rule(self):
+        # returns True if need to stop and are confident enough
+        lambda_hat_t = self.lambda_hat() 
+        beta_t = self.beta_t_mu(self.confidence)
+        return lambda_hat_t > beta_t, lambda_hat_t, beta_t
+
+    def optimal_w(self):
+        if self.skip_optimization():
+            return self.last_w
+        self.n_optimizations += 1
+        
+        # optimal allocation of the known A setting (convex)
+        i_star, _, delta = self.best_empirical_arm()
+
+        w = cp.Variable(self.n)  # Weights for convex combination
+        w_p = self.A.T @ w  # w_p is a convex combination of rows of A
+        t = cp.Variable()
+
+        # Constraints
+        constraints = [cp.sum(w) == 1, w >= 0]
+        for i in range(self.n):
+            if i == i_star:
+                continue
+            denom = cp.sum([(self.A[i, j] - self.A[i_star, j])**2 * cp.inv_pos(w_p[j]) for j in range(self.k)])
+            constraints.append(
+                t >= denom / (delta[i] ** 2)
+            )
+
+        objective = cp.Minimize(t)
+        problem = cp.Problem(objective, constraints)
+        
+        try:
+            problem.solve()
+            if problem.status not in ["optimal", "optimal_inaccurate"]:
+                print("Optimization status failed:", problem.status)
+                self.optimization_failed_flag = True
+            else:
+                self.last_w = np.clip(w.value, 0, None) / np.sum(np.clip(w.value, 0, None))
+                return self.last_w
+        except Exception as e:
+            self.optimization_failed_flag = True
+            print("Optimization failed:", e)
+
+        return np.ones(self.n) / self.n
+
+    def F_on_simplex(self, mu, A, div=101):
+        # F(w) = min_i Delta_i^2 / (2 sum_j (A_ij - A_i*j)^2 / (A^T w)_j) on a grid of the simplex (n = 3)
+        means = np.dot(A, mu)
+        i_star = np.argmax(means)
+        deltas = means - means[i_star]
+        
+        grid_range = np.linspace(0, 1, div)
+        grid = itertools.product(grid_range, repeat=self.n-1)
+        Ts = {}
+        for w in grid:
+            w0 = 1 - sum(w)
+            if w0 < -1e-9:
+                continue
+            w = np.array(([max(w0, 0)] + list(w)))
+            N_Z = np.maximum(np.dot(A.T, w), 1e-12)
+            
+            obj = np.inf
+            for i in range(self.n):
+                if i == i_star:
+                    continue
+                denom = sum([(A[i, j] - A[i_star, j])**2 * (1 / N_Z[j]) for j in range(self.k)])
+                obj = min(obj, (deltas[i] ** 2) / (2 * denom))
+            
+            Ts[tuple(w)] = obj
+            
+        return Ts
+
+    def get_action(self):
+        # Initialization phase
+        if np.any(self.N_Z == 0):  # explore all contexts at least once
+            return np.random.randint(0, self.n), True
+
+        return self.G_tracking()
+
+    def update(self, main_action, post_action, reward):
+        self.T += 1
+        self.N_A[main_action] += 1
+        self.sum_of_rewards[post_action] += reward
+        self.N_Z[post_action] += 1
+        
+        self.optimization_failed_flag = False
